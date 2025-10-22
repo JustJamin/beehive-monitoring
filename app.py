@@ -254,4 +254,65 @@ def update_data_store(_n):
     Output("device-table", "data"),
     Input("data-store", "data")
 )
-def update
+def update_device_table(store_records):
+    if not store_records: return []
+    df = pd.DataFrame(store_records)
+    if df.empty: return []
+    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+    latest = (df.sort_values("time")
+                .groupby("device", as_index=False)
+                .tail(1)[["device","time","satId","temperature","batteryVoltage","hoursUptime"]]
+                .sort_values("device"))
+    latest["last_seen"] = latest["time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    for col, ndp in [("temperature",2),("batteryVoltage",3),("hoursUptime",1)]:
+        if col in latest.columns:
+            latest[col] = pd.to_numeric(latest[col], errors="coerce").round(ndp)
+    cols = ["device","last_seen","satId","temperature","batteryVoltage","hoursUptime"]
+    return latest[cols].to_dict(orient="records")
+
+@app.callback(
+    Output("selected-device", "data"),
+    Input("device-table", "selected_rows"),
+    State("device-table", "data"),
+    prevent_initial_call=False
+)
+def select_device(selected_rows, table_data):
+    if not table_data: return None
+    if not selected_rows: return table_data[0]["device"]
+    idx = max(0, min(selected_rows[0], len(table_data)-1))
+    return table_data[idx]["device"]
+
+@app.callback(
+    Output("device-title", "children"),
+    Output("plots-container", "children"),
+    Input("selected-device", "data"),
+    State("data-store", "data"),
+)
+def render_device_plots(device_id, store_records):
+    if not device_id or not store_records:
+        return "No device selected.", []
+    df = pd.DataFrame(store_records)
+    if df.empty:
+        return f"Device: {device_id}", [html.Div("No data available.")]
+    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+    df_dev = df[df["device"] == device_id].sort_values("time")
+    if df_dev.empty:
+        return f"Device: {device_id}", [html.Div("No data for this device (yet).")]
+    params = infer_parameter_columns(df_dev)
+    graphs = []
+    for p in params:
+        try:
+            fig = make_figure(df_dev, p)
+            graphs.append(dcc.Graph(figure=fig))
+        except Exception as e:
+            graphs.append(html.Div(f"Unable to plot {p}: {e}"))
+    t0 = df_dev["time"].min()
+    t1 = df_dev["time"].max()
+    title = f"Device: {device_id} — samples from {t0.strftime('%Y-%m-%d %H:%M:%S')} to {t1.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    return title, graphs
+
+# -------------------------
+# Run
+# -------------------------
+if __name__ == "__main__":
+    app.run(debug=True)
