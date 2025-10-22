@@ -1,26 +1,26 @@
 import dash
-import dash_leaflet as dl
-from dash import dcc
-from dash import html
-from dash.dependencies import Input, Output
+from dash import dcc, html, dash_table
+from dash.dependencies import Input, Output, State
 import pandas as pd
 from influxdb_client import InfluxDBClient
-from datetime import datetime, timezone
-import time
+from datetime import datetime
 import os
-
+import numpy as np
+import plotly.graph_objs as go
 
 # -------------------------
 # Configuration
 # -------------------------
-# InfluxDB Cloud credentials
-INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN")
-INFLUX_URL = os.environ.get("INFLUX_URL")
-INFLUX_ORG = os.environ.get("INFLUX_ORG")
-INFLUX_BUCKET = "ls300-tracking-demo"
+INFLUX_TOKEN  = os.environ.get("INFLUX_TOKEN")
+INFLUX_URL    = os.environ.get("INFLUX_URL")
+INFLUX_ORG    = os.environ.get("INFLUX_ORG")
+INFLUX_BUCKET = "dashboard-practise"
 
 MEASUREMENT = "tracker_data"
-START_TIME = "2025-06-04T06:17:00Z"  # Adjust as needed
+START_TIME  = "2025-10-22T06:17:00Z"  # Adjust as needed
+
+# Optional: restrict by device prefix; set "" to disable
+DEVICE_PREFIX_FILTER = "satellite"     # "" to disable
 
 # -------------------------
 # Connect to InfluxDB
@@ -29,224 +29,354 @@ client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
 query_api = client.query_api()
 
 # -------------------------
-# Load all data
+# Fields present in your decoder output
 # -------------------------
+FIELDS = [
+    "version", "release", "counter",
+    "time",                # decoder's own time; Influx will also have _time which we map to 'time'
+    "hoursUptime",
+    "almanacValidFrom",
+    "satId",
+    "temperature",
+    "pressure",
+    "humidity",
+    "batteryVoltage",
+    "booleanData",
+    "hall",
+    "userButton",
+    "automatedMode",
+]
 
+# Columns to KEEP from Influx (note: we rename _time→time after the query)
+KEEP_COLS = ["_time","device",
+             "version","release","counter",
+             "hoursUptime","almanacValidFrom","satId",
+             "temperature","pressure","humidity","batteryVoltage",
+             "booleanData","hall","userButton","automatedMode"]
+
+NON_PARAM_COLS = {"time","device","automatedMode"}  # things we do not try to plot
+
+# -------------------------
+# Data I/O
+# -------------------------
 def load_all_data():
     query = f'''
     from(bucket: "{INFLUX_BUCKET}")
       |> range(start: {START_TIME})
       |> filter(fn: (r) => r._measurement == "{MEASUREMENT}")
       |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-      |> keep(columns: ["_time", "device", "latitude", "longitude", "temperature", "humidity", "speed", "altitude", "pressure", "batteryVoltage", "counter", "heading", "hoursUptime", "satId", "userButton", "hall"])
+      |> keep(columns: {KEEP_COLS})
     '''
     df = query_api.query_data_frame(query)
-
-    # Handle case when multiple DataFrames are returned
     if isinstance(df, list):
         df = pd.concat(df, ignore_index=True)
+    if df.empty or "_time" not in df.columns:
+        return pd.DataFrame(columns=["time","device"] + FIELDS)
 
-    # Sometimes empty queries return metadata-only frames
-    if df.empty or '_time' not in df.columns:
-        print("Warning: No data returned from InfluxDB or missing '_time' column.")
-        return pd.DataFrame()  # return empty DataFrame to avoid crash later
+    df = df.rename(columns={"_time":"time"})
+    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
 
-    df = df.rename(columns={"_time": "time"})
-    df["time"] = pd.to_datetime(df["time"])
+    if DEVICE_PREFIX_FILTER:
+        df = df[df["device"].astype(str).str.startswith(DEVICE_PREFIX_FILTER)]
+
+    # Ensure expected columns exist
+    for c in ["time","device"] + FIELDS:
+        if c not in df.columns:
+            df[c] = np.nan
     return df
 
-# Global data store
+def load_since(iso_last_time):
+    query = f'''
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: time(v: "{iso_last_time}"))
+      |> filter(fn: (r) => r._measurement == "{MEASUREMENT}")
+      |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+      |> keep(columns: {KEEP_COLS})
+    '''
+    new_df = query_api.query_data_frame(query)
+    if isinstance(new_df, list):
+        new_df = pd.concat(new_df, ignore_index=True)
+    if new_df.empty:
+        return pd.DataFrame()
+
+    new_df = new_df.rename(columns={"_time":"time"})
+    new_df["time"] = pd.to_datetime(new_df["time"], errors="coerce", utc=True)
+
+    if DEVICE_PREFIX_FILTER:
+        new_df = new_df[new_df["device"].astype(str).str.startswith(DEVICE_PREFIX_FILTER)]
+
+    for c in ["time","device"] + FIELDS:
+        if c not in new_df.columns:
+            new_df[c] = np.nan
+    return new_df
+
+# Global cache mirrored into dcc.Store
 data_df = load_all_data()
 
-# Assign a unique color per device
-device_colors = {}
-color_palette = ["red", "blue", "green", "purple", "yellow", "orange", "pink", "magenta", "cyan", "lime"]
-
 # -------------------------
-# Create Dash App
+# App
 # -------------------------
 app = dash.Dash(__name__)
-app.title = "LS300 Tracker Demo"
+app.title = "Beehive Monitoring Dashboard"
 server = app.server
 
-# CSS page formatting
 app.index_string = '''
 <!DOCTYPE html>
 <html>
-    <head>
-        {%metas%}
-        <title>{%title%}</title>
-        {%favicon%}
-        {%css%}
-        <style>
-            html, body {
-                margin: 0;
-                background: #3c1361;
-                height: 100%;
-            }
-        </style>
-    </head>
-    <body>
-        {%app_entry%}
-        <footer>
-            {%config%}
-            {%scripts%}
-            {%renderer%}
-        </footer>
-    </body>
+  <head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <style>
+      html, body {
+        margin: 0;
+        background: #3c1361;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    {%app_entry%}
+    <footer>
+      {%config%}
+      {%scripts%}
+      {%renderer%}
+    </footer>
+  </body>
 </html>
 '''
 
-# Map centre (I can make this dynamic later)
-if not data_df.empty:
-    map_center = [data_df["latitude"].mean(), data_df["longitude"].mean()]
-else:
-    map_center = [51, -1]  # Default fallback
-
+# -------------------------
+# Layout
+# -------------------------
 app.layout = html.Div(
-    style={
-        "backgroundColor": "#3c1361",  # A rich purple hue
-        "color": "white",              # Ensures good contrast for text
-        "height": "100vh",             # Full vertical height
-        "padding": "10px",
-        "fontFamily": "Ubuntu"
-    },
-    children = [
-        html.Img(
-            src="/assets/logo.png",
-            style={
-                "position": "absolute",
-                "top": "10px",
-                "right": "10px",
-                "height": "120px",
-                "zIndex": "999"
-            }
-        ),
+    style={"backgroundColor":"#3c1361","color":"white","height":"100vh","padding":"10px",
+           "fontFamily":"Ubuntu","display":"flex","flexDirection":"column"},
+    children=[
+        html.Img(src="/assets/logo.png",
+                 style={"position":"absolute","top":"10px","right":"10px","height":"120px","zIndex":"999"}),
         html.H2("Lacuna Space Tracker Demo",
-            style={
-                "fontSize": "3em",  # Increase size as desired
-                "marginBottom": "20px"
-            }
+                style={"fontSize":"3em","marginBottom":"10px","marginTop":"0"}),
+
+        dcc.Store(id="data-store"),
+        dcc.Store(id="selected-device", data=None),
+
+        html.Div(
+            style={"display":"flex","gap":"12px","height":"calc(100vh - 170px)"},
+            children=[
+                # Left: device list (no lat/lon)
+                html.Div(
+                    style={"flex":"0 0 420px","background":"#4a1a78","borderRadius":"16px",
+                           "padding":"12px","overflow":"hidden","display":"flex","flexDirection":"column"},
+                    children=[
+                        html.H3("Devices", style={"marginTop":0}),
+                        dash_table.DataTable(
+                            id="device-table",
+                            columns=[
+                                {"name":"Device","id":"device"},
+                                {"name":"Last Seen (UTC)","id":"last_seen"},
+                                {"name":"satId","id":"satId"},
+                                {"name":"Temp (°C)","id":"temperature"},
+                                {"name":"Battery (V)","id":"batteryVoltage"},
+                                {"name":"Uptime (h)","id":"hoursUptime"},
+                            ],
+                            data=[],
+                            style_table={"height":"100%","overflowY":"auto"},
+                            style_cell={"backgroundColor":"#4a1a78","color":"white"},
+                            style_header={"backgroundColor":"#5b2492","fontWeight":"bold"},
+                            style_data_conditional=[{"if":{"state":"selected"},"backgroundColor":"#6d37a8"}],
+                            row_selectable="single",
+                            page_action="none",
+                            sort_action="native",
+                            filter_action="native",
+                            cell_selectable=True,
+                        ),
+                    ],
+                ),
+                # Right: plots
+                html.Div(
+                    style={"flex":"1 1 auto","background":"#4a1a78","borderRadius":"16px",
+                           "padding":"12px","overflow":"auto"},
+                    children=[
+                        html.Div(id="device-title", style={"fontSize":"1.4rem","marginBottom":"8px"}),
+                        html.Div(id="plots-container"),
+                    ],
+                ),
+            ],
         ),
-        dl.Map(center=map_center, zoom=12, id="live-map", style={'width': '100%', 'height': 'calc(100vh - 120px)'}, children=[
-            dl.TileLayer(),
-            dl.LayerGroup(id="marker-layer")
-        ]),
-        dcc.Interval(id="interval", interval=30*1000, n_intervals=0)
-    ]
+
+        dcc.Interval(id="interval", interval=30*1000, n_intervals=0),
+    ],
 )
 
 # -------------------------
-# Helper to format hover popup
+# Helpers
 # -------------------------
-def format_popup(row):
-    return html.Div([
-        html.B(f"Device: {row['device']}"),
-        html.Br(),
-        f"Time: {row['time'].strftime('%Y-%m-%d %H:%M:%S')}",
-        html.Br(),
-        f"Lat: {row.get('latitude', 'N/A')}°",
-        html.Br(),
-        f"Lon: {row.get('longitude', 'N/A')}°",
-        html.Br(),
-        f"Temp: {row.get('temperature', 'N/A')}°C",
-        html.Br(),
-        f"Humidity: {row.get('humidity', 'N/A')}%",
-        html.Br(),
-        f"Speed: {row.get('speed', 'N/A')} m/s",
-        html.Br(),
-        f"Pressure: {row.get('pressure', 'N/A')} hPa",
-        html.Br(),
-        f"Battery: {row.get('batteryVoltage', 'N/A')} V",
-        html.Br(),
-        f"Uptime: {row.get('hoursUptime', 'N/A')} h"
-    ])
+def infer_parameter_columns(df: pd.DataFrame):
+    """Pick numeric-like columns with at least one non-NaN (booleans map to 0/1)."""
+    if df is None or df.empty:
+        return []
+    cols = []
+    for c in df.columns:
+        if c in NON_PARAM_COLS:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().any():
+            cols.append(c)
+    # Maintain a sensible order: your declared FIELDS first, then any emergent
+    ordered = [c for c in FIELDS if c in cols]
+    ordered += [c for c in cols if c not in ordered]
+    return ordered
+
+YLABELS = {
+    "temperature":"Temperature (°C)",
+    "pressure":"Pressure (hPa)",
+    "humidity":"Humidity (%)",
+    "batteryVoltage":"Battery Voltage (V)",
+    "hoursUptime":"Uptime (hours)",
+    "counter":"Counter",
+    "satId":"Satellite ID",
+    "booleanData":"Boolean Data (bitmask)",
+    "hall":"Hall (0/1)",
+    "userButton":"User Button (0/1)",
+    "version":"Version",
+    "release":"Release",
+}
+
+def make_figure(df_dev: pd.DataFrame, y_col: str) -> go.Figure:
+    y_series = pd.to_numeric(df_dev[y_col], errors="coerce")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df_dev["time"],
+        y=y_series,
+        mode="lines+markers",
+        name=y_col
+    ))
+    fig.update_layout(
+        template="plotly_dark",
+        height=280,
+        margin=dict(l=40, r=20, t=35, b=40),
+        paper_bgcolor="#4a1a78",
+        plot_bgcolor="#4a1a78",
+        xaxis_title="Time (UTC)",
+        yaxis_title=YLABELS.get(y_col, y_col),
+        title=YLABELS.get(y_col, y_col),
+        hovermode="x unified",
+    )
+    return fig
 
 # -------------------------
-# Callback to update map
+# Callbacks
 # -------------------------
 @app.callback(
-    Output("marker-layer", "children"),
-    Input("interval", "n_intervals")
+    Output("data-store", "data"),
+    Input("interval", "n_intervals"),
+    prevent_initial_call=False
 )
-def update_map(n):
+def update_data_store(_n):
     global data_df
-    # Query new data
-    if data_df.empty or "time" not in data_df.columns:
+    if data_df is None or data_df.empty:
+        data_df = load_all_data()
+    else:
+        try:
+            last_time = data_df["time"].max()
+            # Ensure ISO8601 string with timezone for Influx
+            last_time_iso = pd.to_datetime(last_time, utc=True).isoformat()
+            new_df = load_since(last_time_iso)
+            if not new_df.empty:
+                data_df = pd.concat([data_df, new_df], ignore_index=True)
+                data_df.drop_duplicates(subset=["device", "time"], inplace=True)
+                data_df.sort_values(by=["device", "time"], inplace=True)
+        except Exception as e:
+            print(f"Update error: {e}")
+
+    df_tmp = data_df.copy()
+    if not df_tmp.empty:
+        # serialize time to string for Store
+        df_tmp["time"] = pd.to_datetime(df_tmp["time"], utc=True).astype(str)
+    return df_tmp.to_dict(orient="records")
+
+@app.callback(
+    Output("device-table", "data"),
+    Input("data-store", "data")
+)
+def update_device_table(store_records):
+    if not store_records:
+        return []
+    df = pd.DataFrame(store_records)
+    if df.empty:
         return []
 
-    try:
-        last_time = data_df["time"].max().isoformat()
-    except Exception as e:
-        print(f"Error extracting last_time: {e}")
-        return []
-    query = f'''
-    from(bucket: "{INFLUX_BUCKET}")
-      |> range(start: time(v: "{last_time}"))
-      |> filter(fn: (r) => r._measurement == "{MEASUREMENT}")
-      |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-      |> keep(columns: ["_time", "device", "latitude", "longitude", "temperature", "humidity", "speed", "altitude", "pressure", "batteryVoltage", "counter", "heading", "hoursUptime", "satId", "userButton", "hall"])
-    '''
-    new_df = query_api.query_data_frame(query)
-    if not new_df.empty:
-        new_df = new_df.rename(columns={"_time": "time"})
-        new_df["time"] = pd.to_datetime(new_df["time"])
-        data_df = pd.concat([data_df, new_df], ignore_index=True)
-        data_df.drop_duplicates(subset=["device", "time"], inplace=True)
-        data_df.sort_values(by=["device", "time"], inplace=True)
+    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
 
-    # Filter to only include devices starting with "satellite"
-    # To disable this filter, comment out the following line
-    data_df = data_df[data_df["device"].str.startswith("satellite")]
+    latest = (
+        df.sort_values("time")
+          .groupby("device", as_index=False)
+          .tail(1)[["device","time","satId","temperature","batteryVoltage","hoursUptime"]]
+          .sort_values("device")
+    )
+    latest["last_seen"] = latest["time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    # Round friendly numerics
+    for col, ndp in [("temperature",2),("batteryVoltage",3),("hoursUptime",1)]:
+        if col in latest.columns:
+            latest[col] = pd.to_numeric(latest[col], errors="coerce").round(ndp)
 
-    global device_colors  # ensure we’re modifying the global mapping
+    cols = ["device","last_seen","satId","temperature","batteryVoltage","hoursUptime"]
+    return latest[cols].to_dict(orient="records")
 
-    # Assign colors only to new devices
-    for device in data_df["device"].dropna().unique():
-        if device not in device_colors:
-            device_colors[device] = color_palette[len(device_colors) % len(color_palette)]
+@app.callback(
+    Output("selected-device", "data"),
+    Input("device-table", "selected_rows"),
+    State("device-table", "data"),
+    prevent_initial_call=False
+)
+def select_device(selected_rows, table_data):
+    if not table_data:
+        return None
+    if not selected_rows:
+        return table_data[0]["device"]
+    idx = max(0, min(selected_rows[0], len(table_data)-1))
+    return table_data[idx]["device"]
 
-    # Build markers
-    markers = []
-    for _, row in data_df.iterrows():
-        device = row.get("device", "unknown")
-        if device not in device_colors:
-            # Assign next available colour (loop if more devices than colours)
-            device_colors[device] = color_palette[len(device_colors) % len(color_palette)]
+@app.callback(
+    Output("device-title", "children"),
+    Output("plots-container", "children"),
+    Input("selected-device", "data"),
+    State("data-store", "data"),
+)
+def render_device_plots(device_id, store_records):
+    if not device_id or not store_records:
+        return "No device selected.", []
 
-        if pd.notna(row["latitude"]) and pd.notna(row["longitude"]):
-            markers.append(
-                dl.CircleMarker(
-                    center=(row["latitude"], row["longitude"]),
-                    radius=8,
-                    color=device_colors[device],
-                    fill=True,
-                    fillOpacity=0.2,
-                    children=dl.Tooltip(children=format_popup(row))
-                )
-            )
-    
-    # Build lines per device
-    lines = []
-    for device, group in data_df.groupby("device"):
-        group = group.sort_values("time")  # ensure ordered path
-        coords = list(zip(group["latitude"], group["longitude"]))
-        color = device_colors.get(device, "black")  # fallback
+    df = pd.DataFrame(store_records)
+    if df.empty:
+        return f"Device: {device_id}", [html.Div("No data available.")]
 
-        if len(coords) >= 2:
-            lines.append(
-                dl.Polyline(
-                    positions=coords,
-                    color=color,
-                    weight=4,
-                    dashArray="5, 5",  # "on, off" pattern for dashes
-                    opacity=0.6
-                )
-            )
-    return markers + lines
+    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+
+    df_dev = df[df["device"] == device_id].sort_values("time")
+    if df_dev.empty:
+        return f"Device: {device_id}", [html.Div("No data for this device (yet).")]
+
+    params = infer_parameter_columns(df_dev)
+
+    graphs = []
+    for p in params:
+        try:
+            fig = make_figure(df_dev, p)
+            graphs.append(dcc.Graph(figure=fig))
+        except Exception as e:
+            graphs.append(html.Div(f"Unable to plot {p}: {e}"))
+
+    t0 = df_dev["time"].min()
+    t1 = df_dev["time"].max()
+    title = f"Device: {device_id} — samples from {t0.strftime('%Y-%m-%d %H:%M:%S')} to {t1.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
+    return title, graphs
 
 # -------------------------
-# Run the app
+# Run
 # -------------------------
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
